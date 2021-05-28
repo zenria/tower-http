@@ -11,6 +11,7 @@ use proto::{
 };
 use std::{
     collections::HashMap,
+    iter::once,
     net::SocketAddr,
     net::TcpListener,
     pin::Pin,
@@ -27,7 +28,7 @@ use tower::{BoxError, Service};
 use tower_http::{
     compression::CompressionLayer,
     decompression::DecompressionLayer,
-    sensitive_header::SetSensitiveHeaderLayer,
+    sensitive_headers::SetSensitiveHeadersLayer,
     set_header::SetRequestHeaderLayer,
     trace::{DefaultMakeSpan, TraceLayer},
 };
@@ -168,7 +169,7 @@ async fn serve_forever(listener: TcpListener) -> Result<(), Box<dyn std::error::
         // Compress responses
         .layer(CompressionLayer::new())
         // Mark the `Authorization` header as sensitive so it doesn't show in logs
-        .layer(SetSensitiveHeaderLayer::new(header::AUTHORIZATION))
+        .layer(SetSensitiveHeadersLayer::new(once(header::AUTHORIZATION)))
         // Log all requests and responses
         .layer(
             TraceLayer::new_for_grpc().make_span_with(DefaultMakeSpan::new().include_headers(true)),
