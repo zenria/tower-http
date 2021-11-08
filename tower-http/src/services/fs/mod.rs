@@ -1,6 +1,7 @@
 //! File system related services.
 
 use bytes::Bytes;
+use headers::{IfModifiedSince, IfUnmodifiedSince, LastModified};
 use http::{HeaderMap, Response, StatusCode};
 use http_body::{combinators::BoxBody, Body, Empty};
 use pin_project::pin_project;
@@ -94,4 +95,32 @@ fn response_from_io_error(
         }
         _ => Err(err),
     }
+}
+
+fn check_modified_headers(
+    modified: Option<LastModified>,
+    if_unmodified_since: Option<IfUnmodifiedSince>,
+    if_modified_since: Option<IfModifiedSince>,
+) -> Option<StatusCode> {
+    if let Some(since) = if_unmodified_since {
+        let precondition = modified
+            .map(|time| since.precondition_passes(time.into()))
+            .unwrap_or(false);
+
+        if !precondition {
+            return Some(StatusCode::PRECONDITION_FAILED);
+        }
+    }
+
+    if let Some(since) = if_modified_since {
+        let unmodified = modified
+            .map(|time| !since.is_modified(time.into()))
+            // no last_modified means its always modified
+            .unwrap_or(false);
+        if unmodified {
+            return Some(StatusCode::NOT_MODIFIED);
+        }
+    }
+
+    None
 }

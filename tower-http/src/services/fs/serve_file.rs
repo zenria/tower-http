@@ -1,11 +1,12 @@
 //! Service that serves a file.
 
-use super::AsyncReadBody;
+use super::{check_modified_headers, AsyncReadBody};
 use crate::services::fs::DEFAULT_CAPACITY;
 use bytes::Bytes;
 use futures_util::ready;
-use http::{header, HeaderValue, Response};
-use http_body::{combinators::BoxBody, Body};
+use headers::{HeaderMapExt, IfModifiedSince, IfUnmodifiedSince, LastModified};
+use http::{header, HeaderValue, Request, Response, StatusCode};
+use http_body::{combinators::BoxBody, Body, Empty};
 use mime::Mime;
 use std::{
     future::Future,
@@ -74,7 +75,7 @@ impl ServeFile {
     }
 }
 
-impl<R> Service<R> for ServeFile {
+impl<R> Service<Request<R>> for ServeFile {
     type Response = Response<ResponseBody>;
     type Error = io::Error;
     type Future = ResponseFuture;
@@ -84,8 +85,23 @@ impl<R> Service<R> for ServeFile {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _req: R) -> Self::Future {
-        let open_file_future = Box::pin(File::open(self.path.clone()));
+    fn call(&mut self, req: Request<R>) -> Self::Future {
+        let path = self.path.clone();
+        let if_unmodified_since = req.headers().typed_get::<IfUnmodifiedSince>();
+        let if_modified_since = req.headers().typed_get::<IfModifiedSince>();
+
+        let open_file_future = Box::pin(async move {
+            let metadata = std::fs::metadata(&path)?;
+            let modified = metadata.modified().ok().map(LastModified::from);
+
+            if let Some(status_code) =
+                check_modified_headers(modified, if_unmodified_since, if_modified_since)
+            {
+                return Ok(Output::StatusCode(status_code));
+            }
+
+            Ok(Output::File(File::open(path).await?, modified))
+        });
 
         ResponseFuture {
             open_file_future,
@@ -95,11 +111,18 @@ impl<R> Service<R> for ServeFile {
     }
 }
 
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'static>>;
+
 /// Response future of [`ServeFile`].
 pub struct ResponseFuture {
-    open_file_future: Pin<Box<dyn Future<Output = io::Result<File>> + Send + Sync + 'static>>,
+    open_file_future: BoxFuture<io::Result<Output>>,
     mime: Option<HeaderValue>,
     buf_chunk_size: usize,
+}
+
+enum Output {
+    File(File, Option<LastModified>),
+    StatusCode(StatusCode),
 }
 
 impl Future for ResponseFuture {
@@ -108,8 +131,18 @@ impl Future for ResponseFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let result = ready!(Pin::new(&mut self.open_file_future).poll(cx));
 
-        let file = match result {
-            Ok(file) => file,
+        let (file, last_modified) = match result {
+            Ok(output) => match output {
+                Output::File(file, last_modified) => (file, last_modified),
+                Output::StatusCode(status_code) => {
+                    let res = Response::builder()
+                        .status(status_code)
+                        .body(empty_body())
+                        .unwrap();
+
+                    return Poll::Ready(Ok(res));
+                }
+            },
             Err(err) => {
                 return Poll::Ready(
                     super::response_from_io_error(err).map(|res| res.map(ResponseBody)),
@@ -124,9 +157,17 @@ impl Future for ResponseFuture {
         let mut res = Response::new(body);
         res.headers_mut()
             .insert(header::CONTENT_TYPE, self.mime.take().unwrap());
+        if let Some(last_modified) = last_modified {
+            res.headers_mut().typed_insert(last_modified);
+        }
 
         Poll::Ready(Ok(res))
     }
+}
+
+fn empty_body() -> ResponseBody {
+    let body = Empty::new().map_err(|err| match err {}).boxed();
+    ResponseBody(body)
 }
 
 opaque_body! {
@@ -179,5 +220,60 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert!(res.headers().get(header::CONTENT_TYPE).is_none());
+    }
+
+    #[tokio::test]
+    async fn last_modified() {
+        let svc = ServeFile::new("../README.md");
+
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let res = svc.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let last_modified = res
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .expect("Missing last modified header!");
+
+        // -- If-Modified-Since
+
+        let svc = ServeFile::new("../README.md");
+        let req = Request::builder()
+            .header(header::IF_MODIFIED_SINCE, last_modified)
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+
+        let svc = ServeFile::new("../README.md");
+        let req = Request::builder()
+            .header(header::IF_MODIFIED_SINCE, "Fri, 09 Aug 1996 14:21:40 GMT")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // -- If-Unmodified-Since
+
+        let svc = ServeFile::new("../README.md");
+        let req = Request::builder()
+            .header(header::IF_UNMODIFIED_SINCE, last_modified)
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let svc = ServeFile::new("../README.md");
+        let req = Request::builder()
+            .header(header::IF_UNMODIFIED_SINCE, "Fri, 09 Aug 1996 14:21:40 GMT")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
     }
 }
